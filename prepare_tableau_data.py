@@ -2,12 +2,20 @@
 
 Reads the batches and CIPs from SQL Server, works out the status of every unit at
 every moment (Batch, CIP, Dirty or Clean) and when there was capacity available,
-and writes the two Tableau extracts the dashboard uses:
+and writes the data for two Tableau dashboards to the output folder:
 
-    output/Capaciteit_Details.hyper   one row per unit per time slice
-    output/Capaciteit_Overall.hyper   one row per time slice for the whole syrup hall
+    Capacity dashboard ("Vrumona POC - final")
+        Capaciteit_Details.hyper       one row per unit per time slice
+        Capaciteit_Overall.hyper       one row per time slice for the whole syrup hall
+        Vrumona POC - <year>.twbx      the dashboard with this data inside
 
-plus a copy of the dashboard with the new data: output/Vrumona POC - <year>.twbx
+    Workshop dashboard ("Vrumona workshop hour v2"), same data in an older layout
+        AvailabilityPerUnit.hyper
+        AvailabilityOverall.hyper
+        Vrumona workshop hour v2 - <year>.twbx
+
+Every table is also written as a .csv file with the same name, for Excel, SQL or a
+new Tableau connection.
 
 Run it with:  uv run prepare_tableau_data.py
 The "# %%" lines split the script into cells, so you can also run it step by step
@@ -34,10 +42,10 @@ NOT_A_BATCH = ["Purge", "Push Back"]  # short flushes of the mixer, not producti
 # %% 1. Read the batches and CIPs from the database
 
 def read_sql(sql):
-    with pymssql.connect(server=config.SERVER, port=config.PORT, user=config.USER,
-                         password=config.PASSWORD, database=config.DATABASE) as conn:
+    with pymssql.connect(server=config.SERVER, port=config.PORT, user=config.USER, password=config.PASSWORD, database=config.DATABASE) as conn:
         cursor = conn.cursor(as_dict=True)
         cursor.execute(sql)
+
         return pd.DataFrame(cursor.fetchall())
 
 
@@ -46,11 +54,12 @@ raw = read_sql(f"""
     FROM {config.EVENTS_TABLE}
     WHERE PD IN ('{TANKS}', '{MIXERS}')
 """)
+
 raw["Soort"] = np.select(
     [raw.RECIPE_NAME.eq("Batch") & ~raw.PROD_NAME.isin(NOT_A_BATCH),
      raw.RECIPE_NAME.str.contains("CIP", na=False)],
     ["Batch", "CIP"],
-    default="",  # the 'schoon' and 'vuil' rows: we work out clean/dirty ourselves
+    default="",
 )
 
 if config.PD036_TABLE:
@@ -59,7 +68,8 @@ if config.PD036_TABLE:
         FROM {config.PD036_TABLE}
         WHERE PD = '{CIP_UNITS}'
     """)
-    raw_pd036["Soort"] = "CIP"  # a PD036 unit is a CIP installation: it is busy or not
+
+    raw_pd036["Soort"] = "CIP"
     raw = pd.concat([raw, raw_pd036])
 
 print(f"Read {len(raw):,} rows from the database")
@@ -68,6 +78,7 @@ print(f"Read {len(raw):,} rows from the database")
 # %% 2. Clean up: keep only real batches and CIPs with a sensible duration
 
 raw = raw[raw.Soort != ""]
+
 events = pd.DataFrame({
     "Unit": raw.UNIT_NAME,
     "Procesdeel": raw.PD.str.strip(),
@@ -76,6 +87,7 @@ events = pd.DataFrame({
     "Start": raw.START_BATCH,
     "Eind": raw.END_BATCH,
 })
+
 duration = events.Eind - events.Start
 events = events[(duration > pd.Timedelta(0)) & (duration <= MAX_EVENT)]
 
@@ -92,8 +104,10 @@ print(f"{len(events):,} batches and CIPs from {period_start:%d-%m-%Y} to {period
 
 
 # %% 3. Production weeks
-# A production week starts at the start of the shift in which the first mixer batch
-# of that week started, and ends at the end of the shift in which the last one ended.
+# A production week starts at the start of the shift in which the first batch or CIP of
+# that week started (on any tank or mixer), and ends at the end of the shift in which
+# the last one ended. The tanks count too: after the last mixer batch they keep
+# supplying the filling lines, and then they are cleaned.
 
 def shift_start(times):
     return (times - SHIFT_START).dt.floor("8h") + SHIFT_START
@@ -108,10 +122,9 @@ def monday_of(times):
     return days - pd.to_timedelta(days.dt.weekday, unit="D")
 
 
-mixer_batches = events[(events.Procesdeel == MIXERS) & (events.Soort == "Batch")]
-# Production starts up on Sunday evening, so a batch on Sunday belongs to the new week
-weeks = (mixer_batches.groupby(monday_of(mixer_batches.Start + pd.Timedelta(days=1)))
-         .agg(Start=("Start", "min"), Eind=("Eind", "max")))
+week_events = events[events.Procesdeel.isin([TANKS, MIXERS])]
+# Production starts up on Sunday evening, so an event on Sunday belongs to the new week
+weeks = (week_events.groupby(monday_of(week_events.Start + pd.Timedelta(days=1))).agg(Start=("Start", "min"), Eind=("Eind", "max")))
 weeks["Start"] = shift_start(weeks.Start)
 weeks["Eind"] = shift_end(weeks.Eind)
 
@@ -129,14 +142,13 @@ print(f"{len(weeks)} production weeks")
 # and all units share the same slices. The full hours make it possible to show the
 # capacity per hour and per day in the dashboard.
 
-cut_points = (pd.concat([pd.Series(pd.date_range(period_start, period_end, freq="h")),
-                         events.Start, events.Eind, weeks.Start, weeks.Eind])
-              .drop_duplicates().sort_values())
+cut_points = (pd.concat([pd.Series(pd.date_range(period_start, period_end, freq="h")), events.Start, events.Eind, weeks.Start, weeks.Eind]).drop_duplicates().sort_values())
 cut_points = cut_points[cut_points.between(period_start, period_end)].to_numpy()
 
 slices = pd.DataFrame({"Starttijd": cut_points[:-1], "Eindtijd": cut_points[1:]})
 slices["Seconden"] = (slices.Eindtijd - slices.Starttijd).dt.total_seconds().astype("int64")
 slices["Productieweek"] = None  # outside a production week
+
 for w in weeks.itertuples():
     in_week = (slices.Starttijd >= w.Start) & (slices.Starttijd < w.Eind)
     slices.loc[in_week, "Productieweek"] = w.Productieweek
@@ -147,11 +159,11 @@ print(f"{len(slices):,} time slices")
 # %% 5. Status of every unit in every time slice
 #   Batch / CIP        an event is running (both at once: "CIP & Batch")
 #   Clean              the last finished event was a CIP
-#   Dirty              the last finished event was a batch (or there was no event yet)
+#   Dirty              the last finished event was a batch
+#   Niet in gebruik    before the first batch or CIP of the unit (status unknown)
 #   PD036 units are "CIP_Batch" while running and "Beschikbaar" otherwise.
 
 slice_starts = pd.DatetimeIndex(slices.Starttijd)
-
 
 def unit_status(unit_events, procesdeel):
     n = len(slices)
@@ -163,6 +175,7 @@ def unit_status(unit_events, procesdeel):
     for event in unit_events.sort_values("Eind").itertuples():
         first = slice_starts.searchsorted(event.Start)  # first slice of the event
         after = slice_starts.searchsorted(event.Eind)  # first slice after the event
+        
         if event.Soort == "Batch":
             in_batch[first:after] = True
             batch_nr[first:after] = event.Index
@@ -170,20 +183,22 @@ def unit_status(unit_events, procesdeel):
             in_cip[first:after] = True
         if after < n:
             last_finished[after] = event.Soort
+    
     last_finished = last_finished.ffill()  # until the next event finishes
 
     if procesdeel == CIP_UNITS:
         status = np.where(in_cip, "CIP_Batch", "Beschikbaar")
     else:
         status = np.select(
-            [in_batch & in_cip, in_batch, in_cip, last_finished == "CIP"],
-            ["CIP & Batch", "Batch", "CIP", "Clean"],
-            default="Dirty",
+            [in_batch & in_cip, in_batch, in_cip, last_finished == "CIP", last_finished == "Batch"],
+            ["CIP & Batch", "Batch", "CIP", "Clean", "Dirty"],
+            default="Niet in gebruik",
         )
     return status, batch_nr
 
 
 parts = []
+
 for (unit, procesdeel), unit_events in events.groupby(["Unit", "Procesdeel"]):
     part = slices.copy()
     part["slice_nr"] = slices.index
@@ -191,11 +206,11 @@ for (unit, procesdeel), unit_events in events.groupby(["Unit", "Procesdeel"]):
     part["Procesdeel"] = procesdeel
     part["Status"], part["batch_nr"] = unit_status(unit_events, procesdeel)
     parts.append(part)
+
 details = pd.concat(parts, ignore_index=True)
 
 # Add the batch details to the slices in which a batch is running
-batches = events[["Batch_ID", "Start", "Eind"]].rename(
-    columns={"Start": "Batch_StartTime", "Eind": "Batch_FinishTime"})
+batches = events[["Batch_ID", "Start", "Eind"]].rename(columns={"Start": "Batch_StartTime", "Eind": "Batch_FinishTime"})
 details = details.merge(batches, left_on="batch_nr", right_index=True, how="left")
 details["Batch_Duur"] = (details.Batch_FinishTime - details.Batch_StartTime).dt.total_seconds().astype("Int64")
 
@@ -210,9 +225,12 @@ print(f"{details.Unit.nunique()} units, {len(details):,} rows")
 def lasts_two_hours(available, seconds, unit=None):
     """True where `available` holds for an uninterrupted stretch of at least 2 hours."""
     new_stretch = available.ne(available.shift())
+    
     if unit is not None:
         new_stretch |= unit.ne(unit.shift())
+
     stretch_seconds = seconds.groupby(new_stretch.cumsum()).transform("sum")
+    
     return available & (stretch_seconds >= MIN_AVAILABLE.total_seconds())
 
 
@@ -236,6 +254,7 @@ details.loc[details.Procesdeel == CIP_UNITS, "Capaciteit_Netto"] = pd.NA
 def count(procesdeel, condition):
     """Number of units of a process part for which `condition` holds, per time slice."""
     rows = details.Procesdeel == procesdeel
+    
     return condition[rows].groupby(details.slice_nr[rows]).sum().to_numpy()
 
 
@@ -262,46 +281,116 @@ netto = weeks_only.Seconden[weeks_only.Capaciteit_Netto].sum() / total
 print(f"Bruto beschikbaarheid {bruto:.1%}, netto {netto:.1%}, onbenutbare tijd {bruto - netto:.1%}")
 
 
-# %% 8. Write the Tableau extracts (same column names as the original extracts)
+# %% 8. Capacity dashboard ("Vrumona POC - final")
+# Write the two extracts with the same column names as the original ones, and a copy of
+# the dashboard with the new extracts inside.
 
-# The dashboard's colours and sort order expect 10 characters, e.g. "PD017     "
+def write_files(table, name):
+    """Write a table as .hyper (for the dashboards) and as .csv (for Excel, SQL or Tableau)."""
+    hyper_file = config.OUTPUT_DIR / f"{name}.hyper"
+    pantab.frame_to_hyper(table, hyper_file, table=("Extract", "Extract"))
+    # Batch_ID is the only decimal column: write 340735 instead of 340735.0
+    table.to_csv(config.OUTPUT_DIR / f"{name}.csv", index=False, float_format="%.0f")
+    print(f"Written {name}.hyper and {name}.csv")
+    
+    return hyper_file
+
+
+def make_twbx(template, twbx_file, new_extracts):
+    """Copy a .twbx file (a zip file with the workbook and its extracts) with new extracts."""
+    with (zipfile.ZipFile(template) as old,
+          zipfile.ZipFile(twbx_file, "w", zipfile.ZIP_DEFLATED) as new):
+        missing = set(new_extracts) - set(old.namelist())
+        
+        if missing:
+            raise ValueError(f"{template.name} does not contain {missing}")
+        for item in old.infolist():
+            if item.filename in new_extracts:
+                new.write(new_extracts[item.filename], item.filename)
+            else:
+                new.writestr(item, old.read(item.filename))
+    print(f"Written {twbx_file.name}")
+
+
+config.OUTPUT_DIR.mkdir(exist_ok=True)
+
+# Both dashboards' colours and filters expect 10 characters, e.g. "PD017     "
 details["Procesdeel"] = details.Procesdeel.str.ljust(10)
 
-details = details[[
+details_file = write_files(details[[
     "Seconden", "Starttijd", "Eindtijd", "Status", "Unit", "Procesdeel", "Productieweek",
     "Batch_ID", "Batch_StartTime", "Batch_FinishTime", "Capaciteit_Netto",
     "Capaciteit_Bruto", "Batch_Duur",
-]]
-overall = overall[[
+]], "Capaciteit_Details")
+overall_file = write_files(overall[[
     "Productieweek", "Starttijd", "Eindtijd", "Seconden", "Capaciteit_Batchmixers",
     "Capaciteit_Mengtanks", "Capaciteit_Bruto", "Capaciteit_Netto",
     "Aantal_Mengtanks_Beschikbaar", "Aantal_Batchmixers_Beschikbaar",
     "Aantal_Mengtanks_Clean", "Aantal_Mengtanks_Batch", "Aantal_Mengtanks_CIP",
     "Aantal_Batchmixers_Clean", "Aantal_Batchmixers_Batch", "Aantal_BatchMixers_CIP",
-]]
+]], "Capaciteit_Overall")
 
-config.OUTPUT_DIR.mkdir(exist_ok=True)
-details_file = config.OUTPUT_DIR / "Capaciteit_Details.hyper"
-overall_file = config.OUTPUT_DIR / "Capaciteit_Overall.hyper"
-pantab.frame_to_hyper(details, details_file, table=("Extract", "Extract"))
-pantab.frame_to_hyper(overall, overall_file, table=("Extract", "Extract"))
-print(f"Written {details_file.name} and {overall_file.name}")
-
-
-# %% 9. Copy the dashboard with the new extracts inside
-# A .twbx file is a zip file with the workbook and its extracts. We copy it and swap
-# the two extracts for the new ones.
-
-twbx_file = config.OUTPUT_DIR / f"Vrumona POC - {year}.twbx"
-new_extracts = {
+make_twbx(config.POC_TWBX, config.OUTPUT_DIR / f"Vrumona POC - {year}.twbx", {
     "Data/Extracts/Capaciteit_Details Extract.hyper": details_file,
     "Data/Extracts/Capaciteit_Overall Extract.hyper": overall_file,
-}
-with (zipfile.ZipFile(config.TEMPLATE_TWBX) as template,
-      zipfile.ZipFile(twbx_file, "w", zipfile.ZIP_DEFLATED) as new):
-    for item in template.infolist():
-        if item.filename in new_extracts:
-            new.write(new_extracts[item.filename], item.filename)
-        else:
-            new.writestr(item, template.read(item.filename))
-print(f"Written {twbx_file.name}")
+})
+
+
+# %% 9. Workshop dashboard ("Vrumona workshop hour v2")
+# An earlier version of the dashboard. It uses the same statuses, but only for the tanks
+# and mixers, has no production weeks or netto, and uses other column names:
+#   Status            just "Clean" (no Available / Unavailable)
+#   Beschikbaar       1 when no batch or CIP is running, otherwise 0
+#   Bruto_Capaciteit  at least 1 clean mixer and at least 1 clean tank, at any moment
+#   Minutes           number of whole minutes (hh:mm:00) inside the time slice
+
+def whole_minutes(start, end):
+    return (end.dt.ceil("min") - start.dt.ceil("min")) // pd.Timedelta(minutes=1)
+
+
+units = details[details.Procesdeel.str.strip().isin([TANKS, MIXERS])].reset_index(drop=True)
+status = units.Status.replace({"Clean - Available": "Clean", "Clean - Unavailable": "Clean"})
+
+per_unit = pd.DataFrame({
+    "aaID": units.index,
+    "Minutes": whole_minutes(units.Starttijd, units.Eindtijd),
+    "Seconds": units.Seconden,
+    "aaValuePeriodStartTime": units.Starttijd,
+    "aaValuePeriodEndTime": units.Eindtijd,
+    "Beschikbaar": (~status.isin(["Batch", "CIP", "CIP & Batch"])).astype("int64"),
+    "Status": status,
+    "Unit": units.Unit,
+    "Procesdeel": units.Procesdeel,
+})
+
+# One column per unit with its status, e.g. "PD17_Tank_101"
+unit_columns = status.groupby([units.slice_nr, units.Unit]).first().unstack()
+unit_columns.columns = unit_columns.columns.str.replace(":", "_").str.replace(" ", "_")
+tank_columns = [c for c in unit_columns.columns if "Tank" in c]
+mixer_columns = [c for c in unit_columns.columns if "Unit" in c]
+
+overall_v2 = pd.DataFrame({
+    "Minutes": whole_minutes(overall.Starttijd, overall.Eindtijd),
+    "Seconds": overall.Seconden,
+    "aaValuePeriodStartTime": overall.Starttijd,
+    "aaValuePeriodEndTime": overall.Eindtijd,
+    "Bruto_Capaciteit": (overall.Aantal_Batchmixers_Clean > 0) & (overall.Aantal_Mengtanks_Clean > 0),
+})
+
+overall_v2 = overall_v2.join(unit_columns[tank_columns + mixer_columns])
+overall_v2["PD018_Capaciteit"] = overall.Aantal_Batchmixers_Clean > 0
+overall_v2["PD17_Capaciteit"] = overall.Aantal_Mengtanks_Clean > 0
+overall_v2["Tanks_Clean"] = overall.Aantal_Mengtanks_Clean
+overall_v2["Tanks_Batch"] = overall.Aantal_Mengtanks_Batch
+overall_v2["Tanks_CIP"] = overall.Aantal_Mengtanks_CIP
+overall_v2["Mixers_Clean"] = overall.Aantal_Batchmixers_Clean
+overall_v2["Mixers_Batch"] = overall.Aantal_Batchmixers_Batch
+overall_v2["Mixers_CIP"] = overall.Aantal_BatchMixers_CIP
+
+per_unit_file = write_files(per_unit, "AvailabilityPerUnit")
+overall_v2_file = write_files(overall_v2, "AvailabilityOverall")
+
+make_twbx(config.WORKSHOP_TWBX, config.OUTPUT_DIR / f"Vrumona workshop hour v2 - {year}.twbx", {
+    "Data/v2/AvailabilityPerUnit.hyper": per_unit_file,
+    "Data/v2/AvailabilityOverall.hyper": overall_v2_file,
+})

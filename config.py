@@ -18,4 +18,5 @@ PD036_TABLE = "dbo.Tank_bezetting_en_CIP_met_rust_Loop"
 ROOT = Path(__file__).parent
 DATA_DIR = ROOT / "data"  # mounted in the container as /backup
 OUTPUT_DIR = ROOT / "output"
-TEMPLATE_TWBX = DATA_DIR / "Vrumona POC - final.twbx"
+POC_TWBX = DATA_DIR / "Vrumona POC - final.twbx"  # capacity dashboard
+WORKSHOP_TWBX = DATA_DIR / "Vrumona workshop hour v2.twbx"  # workshop dashboard
