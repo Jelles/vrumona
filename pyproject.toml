@@ -1,0 +1,11 @@
+[project]
+name = "vrumona"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "pandas>=3.0.6",
+    "pantab>=5.3.0",
+    "pymssql>=2.4.4",
+]
